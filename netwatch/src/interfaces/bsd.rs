@@ -38,13 +38,47 @@ mod macos;
 use self::macos::*;
 
 pub async fn default_route() -> Option<DefaultRouteDetails> {
-    let idx = default_route_interface_index()?;
-    let interfaces = netdev::get_interfaces();
-    let iface = interfaces.into_iter().find(|i| i.index == idx)?;
-
-    Some(DefaultRouteDetails {
-        interface_name: iface.name,
+    default_route_with(|| {
+        let idx = default_route_interface_index()?;
+        let interfaces = netdev::get_interfaces();
+        let iface = interfaces.into_iter().find(|i| i.index == idx)?;
+        Some(DefaultRouteDetails {
+            interface_name: iface.name,
+        })
     })
+    .await
+}
+
+async fn default_route_with(
+    query: impl FnOnce() -> Option<DefaultRouteDetails> + Send + 'static,
+) -> Option<DefaultRouteDetails> {
+    // Audited async boundary: routing-table sysctl and netdev's system
+    // configuration/file queries are synchronous. Replace this worker when
+    // the platform exposes an asynchronous route-enumeration API.
+    tokio::task::spawn_blocking(query)
+        .await
+        .expect("default-route query task panicked")
+}
+
+#[cfg(test)]
+mod async_route_tests {
+    use std::{sync::mpsc, time::Duration};
+
+    #[tokio::test]
+    async fn synchronous_route_query_does_not_block_the_runtime() {
+        let (started, wait_for_start) = tokio::sync::oneshot::channel();
+        let (release, wait_for_release) = mpsc::sync_channel(1);
+        let query = tokio::spawn(super::default_route_with(move || {
+            started.send(()).expect("announce synchronous query");
+            wait_for_release
+                .recv_timeout(Duration::from_secs(2))
+                .expect("runtime must remain responsive while the OS query blocks");
+            None
+        }));
+        wait_for_start.await.expect("query started");
+        release.send(()).expect("unblock OS query from the runtime");
+        assert!(query.await.expect("query task").is_none());
+    }
 }
 
 /// Locates the home router via the routing table.
